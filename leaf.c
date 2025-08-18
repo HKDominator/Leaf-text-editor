@@ -1,3 +1,5 @@
+/*** include ***/
+
 #include <unistd.h>
 #include <termios.h>
 #include <errno.h>
@@ -5,9 +7,11 @@
 #include <ctype.h>
 #include <stdio.h>
 
+/*** defines ***/
 #define CTRL_KEY(k) ((k) & 0x1f)                                // The CTRL_KEY macro bitwise-ANDs a character with the value 00011111
                                                                 // It mirrors what the ctrl key does in the terminal: it strips bits 5 and 6 from whatever key you pressed in the combination with ctrl
 
+/*** data ***/
 struct termios original_termios;
 
 void die( const char* s)                                        // function used for error handling
@@ -58,6 +62,43 @@ void enableRawMode()
     //With this part, we no longer see on the screen the keys we pressed
 }
 
+char editorReadKey()
+{
+    //function used to read characters. It waits for a keypress and than it returns it.
+    int nread;
+    char char_read;
+    while( (nread = read(STDIN_FILENO, &char_read, 1)) != 1 )
+    {
+        if( nread == -1 && errno != EAGAIN )
+            die("read");
+    }
+    return char_read;
+}
+
+/*** output ***/
+
+void editorClearScreen()
+{
+    write(STDOUT_FILENO, "\x1b[2J", 4);
+}
+
+/*** input ***/
+
+void editorProcessKeypress()
+{
+    //this function processes the key pressed by the 
+    //it maps keys combination to various editor functions 
+    char char_read = editorReadKey();
+
+    switch(char_read)
+    {
+        case CTRL_KEY('x'):
+            exit(0);
+            break;
+    }
+}
+
+/*** init ***/
 
 int main()
 {
@@ -66,20 +107,8 @@ int main()
               
     while(1)                                            //we changed such that the terminal is not waiting for some input
     {
-        char ant = '\0';
-        if( read(STDIN_FILENO, &ant, 1) == -1 && errno != EAGAIN ) 
-            die("read");
-        if( iscntrl(ant) )
-        {
-            printf("%d\r\n", ant);
-        }
-        else{
-            printf("%d ('%c')\r\n", ant, ant);
-        }
-        if( ant == '\n') continue;  
-        if( ant == CTRL_KEY('x'))                       // changed ther exit condition to CTRL x 
-            break;
+        editorClearScreen();
+        editorProcessKeypress();                        // function taht deals with the input
     }        
-					                                    //no more characters to be read
     return 0;
 }
