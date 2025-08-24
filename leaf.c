@@ -6,33 +6,42 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <stdio.h>
+#include <sys/ioctl.h>
+#include <string.h>
 
 /*** defines ***/
 #define CTRL_KEY(k) ((k) & 0x1f)                                // The CTRL_KEY macro bitwise-ANDs a character with the value 00011111
                                                                 // It mirrors what the ctrl key does in the terminal: it strips bits 5 and 6 from whatever key you pressed in the combination with ctrl
 
 /*** data ***/
-struct termios original_termios;
+struct editorConfig{
+    int screenrows, screencols;
+    struct termios original_termios;                            // Original terminal state
+}configuration;
+
+/*** Terminal ***/
 
 void die( const char* s)                                        // function used for error handling
 {
+    write(STDOUT_FILENO, "\x1b[2J", 4);                         // This function is used to clear the screen when we exit. The 2J argument clears the whole screen.
+    write(STDOUT_FILENO, "\x1b[H", 3);
     perror(s);
     exit(1);
 }
 
 void disableRawMode()
 {
-    if( tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_termios) == -1 ) 
+    if( tcsetattr(STDIN_FILENO, TCSAFLUSH, &configuration.original_termios) == -1 ) 
         die("tcsetattr");                                        //when exiting, we reset the terminal to its original state
 }
 
 void enableRawMode()
 {
-    if( tcgetattr(STDIN_FILENO, &original_termios) == -1 )       // read the attributes in a struct 
+    if( tcgetattr(STDIN_FILENO, &configuration.original_termios) == -1 )       // read the attributes in a struct 
         die("tcgetattr");                  
     atexit(disableRawMode);                                      // register our disableRawMode() function to be called automatically when the program exits 
     
-    struct termios to_raw = original_termios;                    // copy of the initial state of the terminal
+    struct termios to_raw = configuration.original_termios;                    // copy of the initial state of the terminal
     //The ECHO feature causes each key you type to be printed to the terminal, so you can see what you’re typing. 
 
     
@@ -75,11 +84,111 @@ char editorReadKey()
     return char_read;
 }
 
+int getCursorPosition(int* rows, int* cols)
+{
+    char buffer[32];
+    unsigned int i = 0;
+    // (void)* rows;
+    // (void)* cols;
+
+    if(write(STDOUT_FILENO, "\x1b[6n", 4) != 4)                   // The n command can be used to query the terminal for status information. I want to give it an argument of 6 to ask for the cursor position.
+        return -1;
+    
+    while( i < sizeof(buffer) - 1 )                               // I store in the buffer the output of that escape sequence.
+    {
+        if( read(STDIN_FILENO, &buffer[i], 1) != 1 )
+            break;
+        if( buffer[i] == 'R' )
+            break;
+        i++;
+    }
+
+    buffer[i] = '\0';                                             // In order print it on the screen i store at the end the terminator. It is needed by the printf function
+
+    if( buffer[0] != '\x1b' || buffer[1] != '[' )
+        return -1;
+    if( sscanf(&buffer[2], "%d;%d", rows, cols) != 2 )            // I split the buffer into to and store the two parts into the two variables.
+        return -1;
+    return 0;
+}
+
+int getWindowSize(int* rows, int* cols)                           // This function gets the initial mesuremenets of the termial window. for more check https://stackoverflow.com/questions/1022957/getting-terminal-width-in-c
+{
+    /*ATTENTION! This will fail on some systems, so i made a fllback method just in case */
+    struct winsize ws;
+
+    if( ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0 ) // ioctl takes the dimensions of the device and places them into the winsize struct
+    {
+        if( write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12 ) return -1;// we are sending to escape sequences one after the other.
+        //C - moves the cursor to the right with 999 spaces to be sure that it reaches the rightest most point. ! It will not go over the boundry of the terminal
+        //B - moves the cursor down with 999 spaces --||--
+        return getCursorPosition(rows, cols);                                                 // TIOCGWINSZ - Terminal Input/Output Control Get Windows Size
+    }
+    else{
+        *rows = ws.ws_row;
+        *cols = ws.ws_col;
+    }
+    return 0;
+}
+
+/*** dynamic string and writing buffer ***/
+
+struct appendBuffer{                                               // we use this to not call so many writes each time we refresh the screen 
+    char* seq;
+    int len;
+};
+
+#define aBuf_init {NULL, 0}
+
+void BufferAdder(struct appendBuffer* ab, const char* s, int len)
+{
+    char* new = realloc(ab->seq, ab->len + len);                   // reallocate somewhere in the memory where there is enough space for the whole string
+
+    if( new == NULL ) return;
+    memcpy(&new[ab->len], s, len);                                 // copy at the end of the existing string the new string 
+    ab->seq = new;
+    ab->len += len;
+}
+
+void BufferFree(struct appendBuffer* ab)
+{
+    free(ab->seq);
+}
+
 /*** output ***/
 
-void editorClearScreen()
+void editorClearScreen(struct appendBuffer* buffer)
 {
-    write(STDOUT_FILENO, "\x1b[2J", 4);
+    BufferAdder(buffer, "\x1b[2J", 4);                            // \x1b is an escape character ( 27 in decimal ). The escape sequence tells the terminal to clear the whole screen.
+                                                                   // for more visit https://vt100.net/docs/vt100-ug/chapter3.html#ED
+}
+
+void repositionCursor(struct appendBuffer* buffer)
+{
+    BufferAdder(buffer, "\x1b[H", 3);                             // Uses the H command to reposition the cursor. It takes two arguments which are implicitly 1 and 1 ( row and column ).
+                                                                   // So \x1b[H can also be written as \x1b[1;1H as here the rows and columns start from 1 not 0.
+}
+
+void editorDrawRows(struct appendBuffer* buffer)
+{
+    for( int i = 0; i < configuration.screenrows; i ++ )
+    {
+        BufferAdder(buffer, "~", 1);
+        if( i < configuration.screenrows - 1 )
+            BufferAdder(buffer, "\r\n", 2);
+    }
+}
+
+void refreshScreen()
+{
+    struct appendBuffer buffer = aBuf_init;
+
+    editorClearScreen(&buffer);
+    repositionCursor(&buffer);
+    editorDrawRows(&buffer);
+    BufferAdder(&buffer, "\x1b[H", 3);
+    write(STDOUT_FILENO, buffer.seq, buffer.len);
+    BufferFree(&buffer);
 }
 
 /*** input ***/
@@ -93,6 +202,8 @@ void editorProcessKeypress()
     switch(char_read)
     {
         case CTRL_KEY('x'):
+            write(STDOUT_FILENO, "\x1b[2J", 4);                    // Again clear the screen
+            write(STDOUT_FILENO, "\x1b[H", 3);
             exit(0);
             break;
     }
@@ -100,15 +211,22 @@ void editorProcessKeypress()
 
 /*** init ***/
 
+void initEditor()
+{
+    if( getWindowSize(&configuration.screenrows, &configuration.screencols) == -1 )
+        die("getWidnowSize");
+}
+
 int main()
 {
     enableRawMode();
     //we now want to be able to take input from the users keyboard
-              
+    initEditor();
+
     while(1)                                            //we changed such that the terminal is not waiting for some input
     {
-        editorClearScreen();
-        editorProcessKeypress();                        // function taht deals with the input
+        refreshScreen();
+        editorProcessKeypress();
     }        
     return 0;
 }
