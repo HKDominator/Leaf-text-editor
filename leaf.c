@@ -12,10 +12,21 @@
 /*** defines ***/
 #define CTRL_KEY(k) ((k) & 0x1f)                                // The CTRL_KEY macro bitwise-ANDs a character with the value 00011111
                                                                 // It mirrors what the ctrl key does in the terminal: it strips bits 5 and 6 from whatever key you pressed in the combination with ctrl
+#define LEAF_VERSION "0.0.1"
+
+enum editorKey{
+    ARROW_LEFT = 1000,
+    ARROW_RIGHT,
+    ARROW_UP,
+    ARROW_DOWN,
+    PAGE_UP,
+    PAGE_DOWN
+};
 
 /*** data ***/
 struct editorConfig{
     int screenrows, screencols;
+    int cursorX, cursorY;
     struct termios original_termios;                            // Original terminal state
 }configuration;
 
@@ -71,7 +82,7 @@ void enableRawMode()
     //With this part, we no longer see on the screen the keys we pressed
 }
 
-char editorReadKey()
+int editorReadKey()
 {
     //function used to read characters. It waits for a keypress and than it returns it.
     int nread;
@@ -81,7 +92,46 @@ char editorReadKey()
         if( nread == -1 && errno != EAGAIN )
             die("read");
     }
-    return char_read;
+    
+    if( char_read == '\x1b' )                   // Pressing an arrow key sends multiple bytes as input to our program. These bytes are in the form of an escape sequence that starts with '\x1b', '[', followed by an 'A', 'B', 'C', or 'D' depending on which of the four arrow keys was pressed.
+    {
+        char seq[3];   
+        if( read(STDIN_FILENO, &seq[0], 1) != 1 )
+            return '\x1b';
+        if( read(STDIN_FILENO, &seq[1], 1) != 1)
+            return '\x1b';
+        if( seq[0] == '[' )
+        {
+            if( seq[1] >= '0' && seq[1] <= '9' )
+            {
+                if( read(STDIN_FILENO, &seq[2], 1) != 1)
+                    return '\x1b';
+                if( seq[2] == '~')
+                {
+                    switch(seq[1])
+                    {
+                        case '5': return PAGE_UP;
+                        case '6': return PAGE_DOWN;
+                    }
+                }
+            }
+            else
+            {
+                switch(seq[1])
+                {
+                    case 'A': return ARROW_UP;
+                    case 'B': return ARROW_DOWN;
+                    case 'C': return ARROW_RIGHT;
+                    case 'D': return ARROW_LEFT;
+                }
+            }
+        }
+        return '\x1b';
+    }
+    else
+    {
+        return char_read;
+    }
 }
 
 int getCursorPosition(int* rows, int* cols)
@@ -160,20 +210,61 @@ void BufferFree(struct appendBuffer* ab)
 void editorClearScreen(struct appendBuffer* buffer)
 {
     BufferAdder(buffer, "\x1b[2J", 4);                            // \x1b is an escape character ( 27 in decimal ). The escape sequence tells the terminal to clear the whole screen.
-                                                                   // for more visit https://vt100.net/docs/vt100-ug/chapter3.html#ED
+                                                                  // for more visit https://vt100.net/docs/vt100-ug/chapter3.html#ED
 }
 
 void repositionCursor(struct appendBuffer* buffer)
 {
-    BufferAdder(buffer, "\x1b[H", 3);                             // Uses the H command to reposition the cursor. It takes two arguments which are implicitly 1 and 1 ( row and column ).
-                                                                   // So \x1b[H can also be written as \x1b[1;1H as here the rows and columns start from 1 not 0.
+    BufferAdder(buffer, "\x1b[H", 3);                                // Uses the H command to reposition the cursor. It takes two arguments which are implicitly 1 and 1 ( row and column ).
+                                                                  // So \x1b[H can also be written as \x1b[1;1H as here the rows and columns start from 1 not 0.
+}
+
+void hideCursor(struct appendBuffer* buffer)
+{
+    BufferAdder(buffer, "\x1b[?25l", 6);                          // This hides the cursor. For more: https://vt100.net/docs/vt100-ug/chapter3.html#SM
+}                                                                 // https://vt100.net/docs/vt510-rm/DECTCEM.html
+
+void showCursor(struct appendBuffer* buffer)
+{
+    BufferAdder(buffer, "\x1b[?25h", 6);                          // This hides the cursor. For more: https://vt100.net/docs/vt100-ug/chapter3.html#RM
+}                                                                 // https://vt100.net/docs/vt510-rm/DECTCEM.html
+
+void reinitializeCursor(struct appendBuffer* buffer)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", configuration.cursorY + 1, configuration.cursorX + 1); 
+    // We changed the old H command into an H command with arguments, specifying the exact position we want the cursor to move to.
+    BufferAdder(buffer, buf, strlen(buf));
 }
 
 void editorDrawRows(struct appendBuffer* buffer)
 {
     for( int i = 0; i < configuration.screenrows; i ++ )
     {
-        BufferAdder(buffer, "~", 1);
+        if( i == configuration.screenrows / 3 )
+        {
+            char welcomeMessage[80];
+            int welcomeLength = snprintf(welcomeMessage, sizeof(welcomeMessage), "Leaf editor -- version %s", LEAF_VERSION); // this moves into welcomeMessage the given string where %s is replaced with over predefined macro the size of welcomeMessage
+            if( welcomeLength > configuration.screencols )
+                welcomeLength = configuration.screencols;
+            
+            int padding = (configuration.screencols - welcomeLength ) / 2;
+            if( padding )
+            {
+                BufferAdder(buffer, "~", 1);
+                padding --;
+            }
+            while(padding--)
+            {
+                BufferAdder(buffer, " ", 1);
+            }
+            BufferAdder(buffer, welcomeMessage, welcomeLength);
+        }
+        else
+        {
+            BufferAdder(buffer, "~", 1);
+        }
+        BufferAdder(buffer, "\x1b[K", 3);                         // this is used instead of the editorClearScreen function. This escape sequence clears the whole line. For more: https://vt100.net/docs/vt100-ug/chapter3.html#EL 
         if( i < configuration.screenrows - 1 )
             BufferAdder(buffer, "\r\n", 2);
     }
@@ -183,21 +274,48 @@ void refreshScreen()
 {
     struct appendBuffer buffer = aBuf_init;
 
-    editorClearScreen(&buffer);
+    hideCursor(&buffer);
+    //editorClearScreen(&buffer);
     repositionCursor(&buffer);
     editorDrawRows(&buffer);
-    BufferAdder(&buffer, "\x1b[H", 3);
+    reinitializeCursor(&buffer);
+    showCursor(&buffer);
+
     write(STDOUT_FILENO, buffer.seq, buffer.len);
     BufferFree(&buffer);
 }
 
 /*** input ***/
 
+
+void moveCursor(int key)
+{
+    switch(key)
+    {
+        case ARROW_LEFT:
+            if( configuration.cursorX != 0 )
+                configuration.cursorX --;
+            break;
+        case ARROW_RIGHT:
+            if( configuration.cursorX != configuration.screencols - 1 )
+                configuration.cursorX ++;
+            break;
+        case ARROW_UP:
+            if( configuration.cursorY != 0 )
+                configuration.cursorY --;
+            break;
+        case ARROW_DOWN:
+            if( configuration.cursorY != configuration.screenrows - 1 )
+                configuration.cursorY ++;
+            break;
+    }
+}
+
 void editorProcessKeypress()
 {
     //this function processes the key pressed by the 
     //it maps keys combination to various editor functions 
-    char char_read = editorReadKey();
+    int char_read = editorReadKey();
 
     switch(char_read)
     {
@@ -206,6 +324,22 @@ void editorProcessKeypress()
             write(STDOUT_FILENO, "\x1b[H", 3);
             exit(0);
             break;
+        case PAGE_DOWN:
+        case PAGE_UP:
+            {
+                int rows = configuration.screenrows;
+                while( rows -- )
+                {
+                    moveCursor( char_read == PAGE_UP ? ARROW_UP : ARROW_DOWN );
+                }
+            }
+            break;
+        case ARROW_DOWN:
+        case ARROW_LEFT:
+        case ARROW_RIGHT:
+        case ARROW_UP:
+            moveCursor(char_read);
+            break;
     }
 }
 
@@ -213,9 +347,12 @@ void editorProcessKeypress()
 
 void initEditor()
 {
+    configuration.cursorX = 0;
+    configuration.cursorY = 0;
     if( getWindowSize(&configuration.screenrows, &configuration.screencols) == -1 )
         die("getWidnowSize");
 }
+
 
 int main()
 {
