@@ -17,7 +17,7 @@
 /*** defines ***/
 #define CTRL_KEY(k) ((k) & 0x1f)                                // The CTRL_KEY macro bitwise-ANDs a character with the value 00011111
                                                                 // It mirrors what the ctrl key does in the terminal: it strips bits 5 and 6 from whatever key you pressed in the combination with ctrl
-#define LEAF_VERSION "0.0.2"
+#define LEAF_VERSION "0.0.3"
 
 enum editorKey{
     ARROW_LEFT = 1000,
@@ -39,9 +39,11 @@ typedef struct textRow{
 }textRow;
 struct editorConfig{
     int screenrows, screencols;
+    int row_offset; // keeps track of what rows are currently being shown
+    int column_offset; // keeps track of what columns are currently being show
     int cursorX, cursorY;
     int rows_number;
-    textRow row;
+    textRow* row;
     struct termios original_termios;                            // Original terminal state
 }configuration;
 
@@ -211,6 +213,21 @@ int getWindowSize(int* rows, int* cols)                           // This functi
     return 0;
 }
 
+/*** Row operations ***/
+
+void AppendRow(char* s, size_t len)             
+{
+    /*This funtion allocates a new text row in the text matrix and stores there the newly written.*/
+    configuration.row = realloc(configuration.row, sizeof(textRow) * ( configuration.rows_number + 1 ) );
+
+    int at = configuration.rows_number;
+    configuration.row[at].size = len;
+    configuration.row[at].chars = malloc(len + 1);
+    memcpy(configuration.row[at].chars, s, len);
+    configuration.row[at].chars[len] = '\0';
+    configuration.rows_number ++;
+}
+
 /*** File I/O ***/
 
 void editorOpen(char* filename)
@@ -222,24 +239,22 @@ void editorOpen(char* filename)
     size_t capacity = 0;
     ssize_t length;
 
-    length = getline(&line, &capacity, fp);
+    while( (length = getline(&line, &capacity, fp)) != -1 ) //This goes to the file line by line and saves in my rows array each line
+    {
     /*
     First, we pass it a null line pointer and a linecap (line capacity) of 0. That makes it allocate new memory for 
     the next line it reads, and set line to point to the memory, and set linecap to let you know how much memory it allocated. 
     Its return value is the length of the line it read, or -1 if it’s at the end of the file and there are no more lines 
     to read.
     */
-    if( length != -1 )
-    {
-        while( length > 0 && ( line[length - 1] == '\n' || line[length - 1] == '\r' ) )
+        if( length != -1 )
         {
-            length --;
+            while( length > 0 && ( line[length - 1] == '\n' || line[length - 1] == '\r' ) )
+            {
+                length --;
+            }
+            AppendRow(line, length);
         }
-        configuration.rows_number = 1;
-        configuration.row.size = length;
-        configuration.row.chars = malloc(length + 1);
-        memcpy(configuration.row.chars, line, length);
-        configuration.row.chars[length] = '\0';
     }
     free(line);
     fclose(fp);
@@ -271,6 +286,26 @@ void BufferFree(struct appendBuffer* ab)
 
 /*** output ***/
 
+void editorScroll()
+{
+    if( configuration.cursorY < configuration.row_offset )
+    {
+        configuration.row_offset = configuration.cursorY;
+    }
+    if( configuration.cursorY >= configuration.row_offset + configuration.screenrows)
+    {
+        configuration.row_offset = configuration.cursorY - configuration.screenrows + 1;
+    }
+    if( configuration.cursorX < configuration.column_offset )
+    {
+        configuration.column_offset = configuration.cursorX;
+    }
+    if( configuration.cursorX >= configuration.column_offset + configuration.screencols )
+    {
+        configuration.column_offset = configuration.cursorX - configuration.screencols + 1;
+    }
+}
+
 void editorClearScreen(struct appendBuffer* buffer)
 {
     BufferAdder(buffer, "\x1b[2J", 4);                            // \x1b is an escape character ( 27 in decimal ). The escape sequence tells the terminal to clear the whole screen.
@@ -296,7 +331,7 @@ void showCursor(struct appendBuffer* buffer)
 void reinitializeCursor(struct appendBuffer* buffer)
 {
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", configuration.cursorY + 1, configuration.cursorX + 1); 
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ( configuration.cursorY - configuration.row_offset ) + 1, ( configuration.cursorX - configuration.column_offset ) + 1); 
     // We changed the old H command into an H command with arguments, specifying the exact position we want the cursor to move to.
     BufferAdder(buffer, buf, strlen(buf));
 }
@@ -305,7 +340,8 @@ void editorDrawRows(struct appendBuffer* buffer)
 {
     for( int i = 0; i < configuration.screenrows; i ++ )
     {
-        if( i >= configuration.rows_number )
+        int file_row = i + configuration.row_offset;
+        if( file_row >= configuration.rows_number )
         {
             if( configuration.rows_number == 0 && i == configuration.screenrows / 3 )
             {
@@ -333,10 +369,11 @@ void editorDrawRows(struct appendBuffer* buffer)
         }
         else
         {
-            int len = configuration.row.size;
+            int len = configuration.row[file_row].size - configuration.column_offset;
+            if( len < 0 ) len = 0;
             if( len > configuration.screencols )
                 len = configuration.screencols;
-            BufferAdder(buffer, configuration.row.chars, len);
+            BufferAdder(buffer, &configuration.row[file_row].chars[configuration.column_offset], len);
         }
         BufferAdder(buffer, "\x1b[K", 3);                         // this is used instead of the editorClearScreen function. This escape sequence clears the whole line. For more: https://vt100.net/docs/vt100-ug/chapter3.html#EL 
         if( i < configuration.screenrows - 1 )
@@ -347,7 +384,7 @@ void editorDrawRows(struct appendBuffer* buffer)
 void refreshScreen()
 {
     struct appendBuffer buffer = aBuf_init;
-
+    editorScroll();
     hideCursor(&buffer);
     //editorClearScreen(&buffer);
     repositionCursor(&buffer);
@@ -361,9 +398,10 @@ void refreshScreen()
 
 /*** input ***/
 
-
 void moveCursor(int key)
 {
+    textRow* row = (configuration.cursorY >= configuration.rows_number ) ? NULL : &configuration.row[configuration.cursorY];
+
     switch(key)
     {
         case ARROW_LEFT:
@@ -371,15 +409,17 @@ void moveCursor(int key)
                 configuration.cursorX --;
             break;
         case ARROW_RIGHT:
-            if( configuration.cursorX != configuration.screencols - 1 )
+            if( row && configuration.cursorX < row->size)
+            {
                 configuration.cursorX ++;
+            }
             break;
         case ARROW_UP:
             if( configuration.cursorY != 0 )
                 configuration.cursorY --;
             break;
         case ARROW_DOWN:
-            if( configuration.cursorY != configuration.screenrows - 1 )
+            if( configuration.cursorY < configuration.rows_number )
                 configuration.cursorY ++;
             break;
     }
@@ -430,6 +470,9 @@ void initEditor()
     configuration.cursorX = 0;
     configuration.cursorY = 0;
     configuration.rows_number = 0;
+    configuration.column_offset = 0;
+    configuration.row_offset = 0;
+    configuration.row = NULL;
     if( getWindowSize(&configuration.screenrows, &configuration.screencols) == -1 )
         die("getWidnowSize");
 }
