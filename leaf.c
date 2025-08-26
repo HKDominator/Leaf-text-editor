@@ -1,5 +1,9 @@
 /*** include ***/
 
+#define _DEFAULT_SOURCE                                        // These three are needed for the getline function
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
 #include <unistd.h>
 #include <termios.h>
 #include <errno.h>
@@ -8,25 +12,36 @@
 #include <stdio.h>
 #include <sys/ioctl.h>
 #include <string.h>
+#include <sys/types.h>
 
 /*** defines ***/
 #define CTRL_KEY(k) ((k) & 0x1f)                                // The CTRL_KEY macro bitwise-ANDs a character with the value 00011111
                                                                 // It mirrors what the ctrl key does in the terminal: it strips bits 5 and 6 from whatever key you pressed in the combination with ctrl
-#define LEAF_VERSION "0.0.1"
+#define LEAF_VERSION "0.0.2"
 
 enum editorKey{
     ARROW_LEFT = 1000,
     ARROW_RIGHT,
     ARROW_UP,
     ARROW_DOWN,
+    DEL_KEY,
+    HOME_KEY,
+    END_KEY,
     PAGE_UP,
     PAGE_DOWN
 };
 
 /*** data ***/
+
+typedef struct textRow{
+    int size;
+    char* chars;
+}textRow;
 struct editorConfig{
     int screenrows, screencols;
     int cursorX, cursorY;
+    int rows_number;
+    textRow row;
     struct termios original_termios;                            // Original terminal state
 }configuration;
 
@@ -110,8 +125,13 @@ int editorReadKey()
                 {
                     switch(seq[1])
                     {
-                        case '5': return PAGE_UP;
-                        case '6': return PAGE_DOWN;
+                        case '1': return HOME_KEY; // The home key escape sequence is <esc>[1~ or <esc>[7~
+                        case '3': return DEL_KEY; // The delete escape sequence is <esc>[3~
+                        case '4': return END_KEY; // The end key escape sequence is <esc>[4~, <esc>[8~
+                        case '5': return PAGE_UP; //The page up escape sequence is <esc>[5~
+                        case '6': return PAGE_DOWN; // The page down escape sequence is <esc>[6~
+                        case '7': return HOME_KEY;
+                        case '8': return END_KEY;
                     }
                 }
             }
@@ -123,7 +143,17 @@ int editorReadKey()
                     case 'B': return ARROW_DOWN;
                     case 'C': return ARROW_RIGHT;
                     case 'D': return ARROW_LEFT;
+                    case 'H': return HOME_KEY; //The home key escape sequence is <esc>[H
+                    case 'F': return END_KEY; //The end key escape sequence is <esc>[F
                 }
+            }
+        }
+        else if( seq[0] == 'O')
+        {
+            switch(seq[1])
+            {
+                case 'H': return HOME_KEY;//The home key escape sequence is <esc>OH
+                case 'F': return END_KEY;//The end key escape sequence is <esc>OF
             }
         }
         return '\x1b';
@@ -179,6 +209,40 @@ int getWindowSize(int* rows, int* cols)                           // This functi
         *cols = ws.ws_col;
     }
     return 0;
+}
+
+/*** File I/O ***/
+
+void editorOpen(char* filename)
+{
+    FILE* fp = fopen(filename, "r");
+    if(!fp) die("fopen");
+
+    char* line = NULL;
+    size_t capacity = 0;
+    ssize_t length;
+
+    length = getline(&line, &capacity, fp);
+    /*
+    First, we pass it a null line pointer and a linecap (line capacity) of 0. That makes it allocate new memory for 
+    the next line it reads, and set line to point to the memory, and set linecap to let you know how much memory it allocated. 
+    Its return value is the length of the line it read, or -1 if it’s at the end of the file and there are no more lines 
+    to read.
+    */
+    if( length != -1 )
+    {
+        while( length > 0 && ( line[length - 1] == '\n' || line[length - 1] == '\r' ) )
+        {
+            length --;
+        }
+        configuration.rows_number = 1;
+        configuration.row.size = length;
+        configuration.row.chars = malloc(length + 1);
+        memcpy(configuration.row.chars, line, length);
+        configuration.row.chars[length] = '\0';
+    }
+    free(line);
+    fclose(fp);
 }
 
 /*** dynamic string and writing buffer ***/
@@ -241,28 +305,38 @@ void editorDrawRows(struct appendBuffer* buffer)
 {
     for( int i = 0; i < configuration.screenrows; i ++ )
     {
-        if( i == configuration.screenrows / 3 )
+        if( i >= configuration.rows_number )
         {
-            char welcomeMessage[80];
-            int welcomeLength = snprintf(welcomeMessage, sizeof(welcomeMessage), "Leaf editor -- version %s", LEAF_VERSION); // this moves into welcomeMessage the given string where %s is replaced with over predefined macro the size of welcomeMessage
-            if( welcomeLength > configuration.screencols )
-                welcomeLength = configuration.screencols;
-            
-            int padding = (configuration.screencols - welcomeLength ) / 2;
-            if( padding )
+            if( configuration.rows_number == 0 && i == configuration.screenrows / 3 )
+            {
+                char welcomeMessage[80];
+                int welcomeLength = snprintf(welcomeMessage, sizeof(welcomeMessage), "Leaf editor -- version %s", LEAF_VERSION); // this moves into welcomeMessage the given string where %s is replaced with over predefined macro the size of welcomeMessage
+                if( welcomeLength > configuration.screencols )
+                    welcomeLength = configuration.screencols;
+                
+                int padding = (configuration.screencols - welcomeLength ) / 2;
+                if( padding )
+                {
+                    BufferAdder(buffer, "~", 1);
+                    padding --;
+                }
+                while(padding--)
+                {
+                    BufferAdder(buffer, " ", 1);
+                }
+                BufferAdder(buffer, welcomeMessage, welcomeLength);
+            }
+            else
             {
                 BufferAdder(buffer, "~", 1);
-                padding --;
             }
-            while(padding--)
-            {
-                BufferAdder(buffer, " ", 1);
-            }
-            BufferAdder(buffer, welcomeMessage, welcomeLength);
         }
         else
         {
-            BufferAdder(buffer, "~", 1);
+            int len = configuration.row.size;
+            if( len > configuration.screencols )
+                len = configuration.screencols;
+            BufferAdder(buffer, configuration.row.chars, len);
         }
         BufferAdder(buffer, "\x1b[K", 3);                         // this is used instead of the editorClearScreen function. This escape sequence clears the whole line. For more: https://vt100.net/docs/vt100-ug/chapter3.html#EL 
         if( i < configuration.screenrows - 1 )
@@ -334,6 +408,12 @@ void editorProcessKeypress()
                 }
             }
             break;
+        case HOME_KEY:
+            configuration.cursorX = 0;
+            break;
+        case END_KEY:
+            configuration.cursorX = configuration.screencols - 1;
+            break;
         case ARROW_DOWN:
         case ARROW_LEFT:
         case ARROW_RIGHT:
@@ -349,16 +429,21 @@ void initEditor()
 {
     configuration.cursorX = 0;
     configuration.cursorY = 0;
+    configuration.rows_number = 0;
     if( getWindowSize(&configuration.screenrows, &configuration.screencols) == -1 )
         die("getWidnowSize");
 }
 
 
-int main()
+int main(int argc, char* argv[] )
 {
     enableRawMode();
     //we now want to be able to take input from the users keyboard
-    initEditor();
+    initEditor();   
+    if( argc >= 2 )
+    {
+        editorOpen(argv[1]);
+    }
 
     while(1)                                            //we changed such that the terminal is not waiting for some input
     {
