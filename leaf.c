@@ -13,11 +13,15 @@
 #include <sys/ioctl.h>
 #include <string.h>
 #include <sys/types.h>
+#include <time.h>
+#include <stdarg.h>
 
 /*** defines ***/
+
 #define CTRL_KEY(k) ((k) & 0x1f)                                // The CTRL_KEY macro bitwise-ANDs a character with the value 00011111
                                                                 // It mirrors what the ctrl key does in the terminal: it strips bits 5 and 6 from whatever key you pressed in the combination with ctrl
-#define LEAF_VERSION "0.0.3"
+#define LEAF_VERSION "0.0.4"
+#define LEAF_TAB_STOP 8
 
 enum editorKey{
     ARROW_LEFT = 1000,
@@ -35,15 +39,22 @@ enum editorKey{
 
 typedef struct textRow{
     int size;
+    int rsize; // the render size used for tabs or other non printable characters
     char* chars;
+    char* render;
 }textRow;
+
 struct editorConfig{
     int screenrows, screencols;
     int row_offset; // keeps track of what rows are currently being shown
     int column_offset; // keeps track of what columns are currently being show
     int cursorX, cursorY;
+    int renderX;    // the position of the cursor taking the tabs into consideration
     int rows_number;
     textRow* row;
+    char* filename;
+    char statusmsg[80]; // these two are for the status message 
+    time_t statusmsg_time;
     struct termios original_termios;                            // Original terminal state
 }configuration;
 
@@ -215,6 +226,48 @@ int getWindowSize(int* rows, int* cols)                           // This functi
 
 /*** Row operations ***/
 
+int CursorXToRenderXConverter(textRow* row, int cursorX)
+{
+    /*I use rx % KILO_TAB_STOP to find out how many columns we are to the right of the last tab stop, 
+    and then subtract that from KILO_TAB_STOP - 1 to find out how many columns we are to the left of the next tab stop. 
+    We add that amount to rx to get just to the left of the next tab stop, and then the unconditional rx++ statement gets 
+    us right on the next tab stop*/
+    int renderX = 0;
+    for( int i = 0; i < cursorX; i ++ )
+    {
+        if( row->chars[i] == '\t' )
+        {
+            renderX += (LEAF_TAB_STOP - 1) - (renderX % LEAF_TAB_STOP);
+        }
+        renderX ++;
+    }
+    return renderX;
+}
+
+void UpdateRow(textRow* row)
+{
+    int tabs = 0;
+    for( int i = 0; i < row->size; i ++ )
+        if( row->chars[i] == '\t' )
+            tabs++;
+
+    free(row->render);
+    row->render = malloc( row->size + tabs*(LEAF_TAB_STOP - 1) + 1);
+    int idx = 0;
+    for( int i = 0; i < row->size; i ++ )
+        if( row->chars[i] == '\t' )
+        {
+            row->render[idx++] = ' ';
+            while( idx % LEAF_TAB_STOP != 0 ) row->render[idx++] = ' ';
+        }
+        else
+        {
+            row->render[idx++] = row->chars[i];
+        }
+    row->render[idx] = '\0';
+    row->rsize = idx;
+}
+
 void AppendRow(char* s, size_t len)             
 {
     /*This funtion allocates a new text row in the text matrix and stores there the newly written.*/
@@ -225,13 +278,21 @@ void AppendRow(char* s, size_t len)
     configuration.row[at].chars = malloc(len + 1);
     memcpy(configuration.row[at].chars, s, len);
     configuration.row[at].chars[len] = '\0';
+
+    configuration.row[at].rsize = 0;                                // initializing the render size and string for the new line
+    configuration.row[at].render = NULL;
+
+    UpdateRow(&configuration.row[at]);
+
     configuration.rows_number ++;
-}
+}   
 
 /*** File I/O ***/
 
 void editorOpen(char* filename)
 {
+    free(configuration.filename);
+    configuration.filename = strdup(filename); //It makes a copy of the given string, allocating the required memory and assuming you will free() that memory.
     FILE* fp = fopen(filename, "r");
     if(!fp) die("fopen");
 
@@ -286,8 +347,60 @@ void BufferFree(struct appendBuffer* ab)
 
 /*** output ***/
 
+void drawStatusBar(struct appendBuffer* buffer)
+{
+    /* For more informations here is the link i used: https://vt100.net/docs/vt100-ug/chapter3.html#SGR
+    Apparrently to invert the colours of a line there is an escape sequence: <esc>[7m and <esc>[m switches them back
+    We will display in the status bar the following things:
+
+    -the name of the file if a file is opened or [NO NAME] if we are not using a file
+    -the number of lines in the file (again if that is the case)
+    -the line number we are currently at
+    
+    */
+    char status[80], lineNumber[80];
+    BufferAdder(buffer, "\x1b[7m", 4);
+
+    int len = snprintf(status, sizeof(status), "%.20s - %d lines", 
+        configuration.filename ? configuration.filename : "[NO NAME]", configuration.rows_number); //"prints" in the status char max 20 characters from the file name and the number of lines in the file
+    int len_line_number = snprintf(lineNumber, sizeof(lineNumber), "%d/%d", 
+        configuration.cursorY + 1, configuration.rows_number); // we use cursorY + 1 because it is 0 indexed
+    if( len > configuration.screencols )
+        len = configuration.screencols; //we make sure the status bar is only one line long
+    BufferAdder(buffer, status, len);
+    while( len < configuration.screencols )
+    {
+        if( configuration.screencols - len == len_line_number )
+        {
+            BufferAdder(buffer, lineNumber, len_line_number);
+            break;
+        }
+        else
+        {
+            BufferAdder(buffer, " ", 1);
+            len++;
+        }
+    }
+    BufferAdder(buffer, "\x1b[m", 3);
+    BufferAdder(buffer, "\r\n", 2);
+}
+
+void drawMessageBar(struct appendBuffer* buffer )
+{
+    BufferAdder(buffer, "\x1b[K", 3); //this clears the last row
+    int msglen = strlen(configuration.statusmsg);
+    if( msglen > configuration.screencols )
+        msglen = configuration.screencols;
+    if( msglen && time(NULL) - configuration.statusmsg_time < 5 )
+        BufferAdder(buffer, configuration.statusmsg, msglen);
+}
+
 void editorScroll()
 {
+    configuration.renderX = 0;
+    if( configuration.cursorY < configuration.rows_number )
+        configuration.renderX = CursorXToRenderXConverter(&configuration.row[configuration.cursorY], configuration.cursorX);
+
     if( configuration.cursorY < configuration.row_offset )
     {
         configuration.row_offset = configuration.cursorY;
@@ -296,13 +409,13 @@ void editorScroll()
     {
         configuration.row_offset = configuration.cursorY - configuration.screenrows + 1;
     }
-    if( configuration.cursorX < configuration.column_offset )
+    if( configuration.renderX < configuration.column_offset )
     {
-        configuration.column_offset = configuration.cursorX;
+        configuration.column_offset = configuration.renderX;
     }
-    if( configuration.cursorX >= configuration.column_offset + configuration.screencols )
+    if( configuration.renderX >= configuration.column_offset + configuration.screencols )
     {
-        configuration.column_offset = configuration.cursorX - configuration.screencols + 1;
+        configuration.column_offset = configuration.renderX - configuration.screencols + 1;
     }
 }
 
@@ -331,7 +444,7 @@ void showCursor(struct appendBuffer* buffer)
 void reinitializeCursor(struct appendBuffer* buffer)
 {
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ( configuration.cursorY - configuration.row_offset ) + 1, ( configuration.cursorX - configuration.column_offset ) + 1); 
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ( configuration.cursorY - configuration.row_offset ) + 1, ( configuration.renderX - configuration.column_offset ) + 1); 
     // We changed the old H command into an H command with arguments, specifying the exact position we want the cursor to move to.
     BufferAdder(buffer, buf, strlen(buf));
 }
@@ -369,15 +482,14 @@ void editorDrawRows(struct appendBuffer* buffer)
         }
         else
         {
-            int len = configuration.row[file_row].size - configuration.column_offset;
+            int len = configuration.row[file_row].rsize - configuration.column_offset;
             if( len < 0 ) len = 0;
             if( len > configuration.screencols )
                 len = configuration.screencols;
-            BufferAdder(buffer, &configuration.row[file_row].chars[configuration.column_offset], len);
+            BufferAdder(buffer, &configuration.row[file_row].render[configuration.column_offset], len);
         }
         BufferAdder(buffer, "\x1b[K", 3);                         // this is used instead of the editorClearScreen function. This escape sequence clears the whole line. For more: https://vt100.net/docs/vt100-ug/chapter3.html#EL 
-        if( i < configuration.screenrows - 1 )
-            BufferAdder(buffer, "\r\n", 2);
+        BufferAdder(buffer, "\r\n", 2);
     }
 }
 
@@ -389,11 +501,23 @@ void refreshScreen()
     //editorClearScreen(&buffer);
     repositionCursor(&buffer);
     editorDrawRows(&buffer);
+    drawStatusBar(&buffer);
+    drawMessageBar(&buffer);
+
     reinitializeCursor(&buffer);
     showCursor(&buffer);
 
     write(STDOUT_FILENO, buffer.seq, buffer.len);
     BufferFree(&buffer);
+}
+
+void setStatusMessage(const char* format, ... )
+{
+    va_list ap;                // comes from the stdarg library. lets you access the variable arguments (...).
+    va_start(ap,format);       // va_start sets up ap so it points to the first unnamed argument (the ones in ...).
+    vsnprintf(configuration.statusmsg, sizeof(configuration.statusmsg), format, ap); //vsnprintf is like snprintf, but it takes a va_list instead of a variable number of arguments.
+    va_end(ap);                //This tells the system you’re done with the variable arguments.
+    configuration.statusmsg_time = time(NULL);
 }
 
 /*** input ***/
@@ -407,11 +531,21 @@ void moveCursor(int key)
         case ARROW_LEFT:
             if( configuration.cursorX != 0 )
                 configuration.cursorX --;
+            else if(configuration.cursorY > 0)
+            {
+                configuration.cursorY --;
+                configuration.cursorX = configuration.row[configuration.cursorY].size;  // allows the user to press ← at the beginning of the line to move to the end of the previous line.
+            }
             break;
         case ARROW_RIGHT:
             if( row && configuration.cursorX < row->size)
             {
                 configuration.cursorX ++;
+            }
+            else if( row && configuration.cursorX == row->size )
+            {
+                configuration.cursorY ++;
+                configuration.cursorX = 0;
             }
             break;
         case ARROW_UP:
@@ -423,6 +557,10 @@ void moveCursor(int key)
                 configuration.cursorY ++;
             break;
     }
+    row = (configuration.cursorY >= configuration.rows_number ) ? NULL : &configuration.row[configuration.cursorY];
+    int row_length = row ? row->size : 0;                       // this section is used to correct the cursor positioning in case
+    if( configuration.cursorX > row_length )                    // you go down from a long line to a short line. It snaps the curosr to the end
+        configuration.cursorX = row_length;                     // of the line.
 }
 
 void editorProcessKeypress()
@@ -441,6 +579,17 @@ void editorProcessKeypress()
         case PAGE_DOWN:
         case PAGE_UP:
             {
+                if( char_read == PAGE_UP ) //Now that i have scrolling, let’s make the Page Up and Page Down keys scroll up or down an entire page.
+                {
+                    configuration.cursorY = configuration.row_offset;
+                }
+                else if( char_read == PAGE_DOWN )
+                {
+                    configuration.cursorY = configuration.row_offset + configuration.screenrows - 1;
+                    if( configuration.cursorY > configuration.rows_number )
+                        configuration.cursorY = configuration.rows_number;
+                }
+                
                 int rows = configuration.screenrows;
                 while( rows -- )
                 {
@@ -452,7 +601,8 @@ void editorProcessKeypress()
             configuration.cursorX = 0;
             break;
         case END_KEY:
-            configuration.cursorX = configuration.screencols - 1;
+            if( configuration.cursorY < configuration.rows_number ) 
+                configuration.cursorX = configuration.row[configuration.cursorY].size; //the end key press will make the cursor go to the end of the current line
             break;
         case ARROW_DOWN:
         case ARROW_LEFT:
@@ -472,9 +622,14 @@ void initEditor()
     configuration.rows_number = 0;
     configuration.column_offset = 0;
     configuration.row_offset = 0;
+    configuration.renderX = 0;
     configuration.row = NULL;
+    configuration.filename = NULL;
+    configuration.statusmsg[0] = '\0';
+    configuration.statusmsg_time = 0;
     if( getWindowSize(&configuration.screenrows, &configuration.screencols) == -1 )
         die("getWidnowSize");
+    configuration.screenrows -=2 ; // we leave an empty line at the end for the status bar and another one for the message box
 }
 
 
@@ -487,6 +642,8 @@ int main(int argc, char* argv[] )
     {
         editorOpen(argv[1]);
     }
+
+    setStatusMessage("HELP: Ctrl-X = quit");
 
     while(1)                                            //we changed such that the terminal is not waiting for some input
     {
