@@ -276,12 +276,14 @@ void UpdateRow(textRow* row)
     row->rsize = idx;
 }
 
-void AppendRow(char* s, size_t len)             
+void insertRow(int at, char* s, size_t len)             
 {
-    /*This funtion allocates a new text row in the text matrix and stores there the newly written.*/
+    /*This funtion allocates a new text row in the text matrix and inserts it at the given position.*/
+    if( at < 0 || at > configuration.rows_number )
+        return;
     configuration.row = realloc(configuration.row, sizeof(textRow) * ( configuration.rows_number + 1 ) );
+    memmove(&configuration.row[at + 1], &configuration.row[at], sizeof(textRow) * (configuration.rows_number - at));
 
-    int at = configuration.rows_number;
     configuration.row[at].size = len;
     configuration.row[at].chars = malloc(len + 1);
     memcpy(configuration.row[at].chars, s, len);
@@ -308,14 +310,90 @@ void rowInsertChar( textRow* row, int at, int c )
     configuration.dirty ++;
 }
 
+void rowDeleteChar( textRow* row, int at)
+{
+    if( at < 0 || at > row->size )
+        at = row->size;
+    memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
+    row->size --;
+    UpdateRow(row);
+    configuration.dirty ++;
+}
+
+void freeRow(textRow* row)
+{
+    free(row->chars);
+    free(row->render);
+}
+
+void deleteRow(int at)
+{
+    if( at < 0 || at >= configuration.rows_number ) //we validate the index
+        return;
+    freeRow(&configuration.row[at]);    //free memory owned by the deleted row
+    memmove(&configuration.row[at], &configuration.row[at + 1], sizeof(textRow) * (configuration.rows_number - at - 1)); 
+    configuration.rows_number --;//memmove() to overwrite the deleted row struct with the rest of the rows that come after it, and decrement the number of rows. 
+    configuration.dirty ++;
+}
+
+void rowAppendString( textRow* row, char* s, size_t len )
+{
+    row->chars = realloc( row->chars, row->size + len + 1); // make space for the new string
+    memcpy( &row->chars[row->size], s, len ); // copy the string at the end of the row
+    row->size += len; // increase the size of the current line
+    row->chars[row->size] = '\0'; // add the terminator
+    UpdateRow(row);
+    configuration.dirty ++;
+}
+
 /*** Editor operations ***/
+
+void insertNewLine()
+{
+    if( configuration.cursorX == 0 )
+    {
+        insertRow(configuration.cursorY, "", 0);
+    }
+    else
+    {
+        textRow* row = &configuration.row[configuration.cursorY]; // we trunchiate the current row into two and we move  one on the next line,
+        insertRow(configuration.cursorY + 1, &row->chars[configuration.cursorX], row->size - configuration.cursorX);
+        row = &configuration.row[configuration.cursorY]; // we reinitialize our pointer and we place the terminator on our first part of the trunchiated sequence 
+        row->size = configuration.cursorX;
+        row->chars[row->size] = '\0';
+        UpdateRow(row);
+    }
+    configuration.cursorY ++;
+    configuration.cursorX = 0;
+}
 
 void insertChar(int c)
 {
     if( configuration.cursorY == configuration.rows_number )
-        AppendRow("", 0);   // in case we are at the end of our file.
+        insertRow(configuration.rows_number, "", 0);   // in case we are at the end of our file.
     rowInsertChar(&configuration.row[configuration.cursorY], configuration.cursorX, c);
     configuration.cursorX++;
+}
+
+void deleteChar()
+{
+    if( configuration.cursorY == configuration.rows_number )
+        return;
+    if( configuration.cursorX == 0 && configuration.cursorY == 0 )
+        return;
+    textRow* row = &configuration.row[configuration.cursorY];
+    if( configuration.cursorX > 0 )
+    {
+        rowDeleteChar(row, configuration.cursorX - 1);
+        configuration.cursorX --;
+    }
+    else
+    {
+        configuration.cursorX = configuration.row[configuration.cursorY - 1].size;
+        rowAppendString(&configuration.row[configuration.cursorY - 1], row->chars, row->size);
+        deleteRow(configuration.cursorY);
+        configuration.cursorY --;
+    }
 }
 
 /*** File I/O ***/
@@ -374,7 +452,7 @@ void editorOpen(char* filename)
             {
                 length --;
             }
-            AppendRow(line, length);
+            insertRow(configuration.rows_number, line, length);
         }
     }
     free(line);
@@ -663,7 +741,7 @@ void editorProcessKeypress()
     switch(char_read)
     {
         case '\r':
-            /*TODO*/
+            insertNewLine();
             break;
         case CTRL_KEY('x'):
             if ( configuration.dirty && quit_times > 0 )
@@ -718,7 +796,8 @@ void editorProcessKeypress()
         case BACKSPACE:
         case CTRL_KEY('h'):
         case DEL_KEY:
-            /*TODO*/
+            if( char_read == DEL_KEY ) moveCursor(ARROW_RIGHT);
+            deleteChar();
             break;
         case CTRL_KEY('l'):
         case '\x1b':        //we don't do anything when these to are pressed. For example, ctrl-l key refreshes the terminal but the terminal is automatically refreshed
