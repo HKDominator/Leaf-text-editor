@@ -15,6 +15,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <stdarg.h>
+#include <fcntl.h>
 
 /*** defines ***/
 
@@ -22,8 +23,10 @@
                                                                 // It mirrors what the ctrl key does in the terminal: it strips bits 5 and 6 from whatever key you pressed in the combination with ctrl
 #define LEAF_VERSION "0.0.4"
 #define LEAF_TAB_STOP 8
+#define LEAF_QUIT_TIMES 2
 
 enum editorKey{
+    BACKSPACE = 127,    
     ARROW_LEFT = 1000,
     ARROW_RIGHT,
     ARROW_UP,
@@ -51,12 +54,17 @@ struct editorConfig{
     int cursorX, cursorY;
     int renderX;    // the position of the cursor taking the tabs into consideration
     int rows_number;
+    int dirty;      // this is a flag which tells whether the file has unsaved modifications
     textRow* row;
     char* filename;
     char statusmsg[80]; // these two are for the status message 
     time_t statusmsg_time;
     struct termios original_termios;                            // Original terminal state
 }configuration;
+
+/*** Prototypes ***/
+
+void setStatusMessage(const char* format, ... ); // otherwise we wouldn't be able to compile the save to file function because we used there a function before it was defined
 
 /*** Terminal ***/
 
@@ -285,9 +293,61 @@ void AppendRow(char* s, size_t len)
     UpdateRow(&configuration.row[at]);
 
     configuration.rows_number ++;
+    configuration.dirty ++;
 }   
 
+void rowInsertChar( textRow* row, int at, int c )
+{
+    if( at < 0 || at > row->size )
+        at = row->size;
+    row->chars = realloc(row->chars, row->size + 2); // we allocate two more because one is for the new char and the second is for the terminator
+    memmove(&row->chars[at + 1], &row->chars[at], row->size  - at + 1);//memmove() is used to copy a block of memory from a location to another. This first moves it into a buffer than into the new location so there is no problem with string overlap.
+    row->size ++;
+    row->chars[at] = c;
+    UpdateRow(row);
+    configuration.dirty ++;
+}
+
+/*** Editor operations ***/
+
+void insertChar(int c)
+{
+    if( configuration.cursorY == configuration.rows_number )
+        AppendRow("", 0);   // in case we are at the end of our file.
+    rowInsertChar(&configuration.row[configuration.cursorY], configuration.cursorX, c);
+    configuration.cursorX++;
+}
+
 /*** File I/O ***/
+
+char* rowsToString( int* bufferLength )
+{
+    /*
+    Joins all rows from the editor configuration into a single character buffer, separated by newline characters. 
+    The function returns the buffer and stores its length in *bufferLength.
+    The returned buffer:
+     - Contains exactly the row data + one '\n' per row.
+     - Is NOT null-terminated.
+     - Must be freed by the caller after use.*/
+    int totalLength = 0;
+    for( int i = 0; i < configuration.rows_number; i ++ )
+    {
+        totalLength += configuration.row[i].size + 1;
+    }
+    *bufferLength = totalLength;
+
+    char* buffer = malloc(totalLength);
+    char* aux = buffer;
+    for( int i = 0; i < configuration.rows_number; i ++ )
+    {
+        memcpy(aux, configuration.row[i].chars, configuration.row[i].size);//we copy in the auxiliary buffer the line
+        aux += configuration.row[i].size; // we move the pointer with the size of the new sentence
+        *aux = '\n';// we add the '\n' character where the auxiliary pointer points
+        aux ++; // we move on and prepare for the next line
+    }
+
+    return buffer;
+}
 
 void editorOpen(char* filename)
 {
@@ -319,6 +379,34 @@ void editorOpen(char* filename)
     }
     free(line);
     fclose(fp);
+    configuration.dirty = 0; //to reset the dirty flag
+}
+
+void saveToFile()
+{
+    if( configuration.filename == NULL )
+        return;
+    int length;
+    char* buffer = rowsToString(&length);
+
+    int fd = open(configuration.filename, O_RDWR | O_CREAT, 0644 );  //flags needed by the open function
+    if( fd != -1 )
+    {
+        if( ftruncate(fd, length) != -1 ) // this sets the file size with the given dimension
+        {
+            if( write(fd, buffer, length) == length ) // we added 3 layers of protection in case something fails.
+            {
+                close(fd);
+                free(buffer);
+                configuration.dirty = 0; // we reset the flag if we save the file
+                setStatusMessage("%d bytes written to disk", length); // we send a mission acomplished message when we succesfully saved the file
+                return;
+            }
+        }
+        close(fd);
+    }
+    free(buffer);
+    setStatusMessage("Saving failed. I/O error: %s", strerror(errno));
 }
 
 /*** dynamic string and writing buffer ***/
@@ -361,8 +449,9 @@ void drawStatusBar(struct appendBuffer* buffer)
     char status[80], lineNumber[80];
     BufferAdder(buffer, "\x1b[7m", 4);
 
-    int len = snprintf(status, sizeof(status), "%.20s - %d lines", 
-        configuration.filename ? configuration.filename : "[NO NAME]", configuration.rows_number); //"prints" in the status char max 20 characters from the file name and the number of lines in the file
+    int len = snprintf(status, sizeof(status), "%.20s - %d lines %s", 
+        configuration.filename ? configuration.filename : "[NO NAME]", configuration.rows_number,
+    configuration.dirty ? "(modified)" : ""); //"prints" in the status char max 20 characters from the file name and the number of lines in the file
     int len_line_number = snprintf(lineNumber, sizeof(lineNumber), "%d/%d", 
         configuration.cursorY + 1, configuration.rows_number); // we use cursorY + 1 because it is 0 indexed
     if( len > configuration.screencols )
@@ -389,7 +478,7 @@ void drawMessageBar(struct appendBuffer* buffer )
 {
     BufferAdder(buffer, "\x1b[K", 3); //this clears the last row
     int msglen = strlen(configuration.statusmsg);
-    if( msglen > configuration.screencols )
+    if( msglen > configuration.screencols ) 
         msglen = configuration.screencols;
     if( msglen && time(NULL) - configuration.statusmsg_time < 5 )
         BufferAdder(buffer, configuration.statusmsg, msglen);
@@ -568,13 +657,28 @@ void editorProcessKeypress()
     //this function processes the key pressed by the 
     //it maps keys combination to various editor functions 
     int char_read = editorReadKey();
+    static int quit_times = LEAF_QUIT_TIMES;
+
 
     switch(char_read)
     {
+        case '\r':
+            /*TODO*/
+            break;
         case CTRL_KEY('x'):
+            if ( configuration.dirty && quit_times > 0 )
+            {
+                setStatusMessage("WARNING! FIle has unsaved changes. "
+                "Press Ctrl-X %d more times to quit.", quit_times);
+                quit_times --;
+                return;
+            }
             write(STDOUT_FILENO, "\x1b[2J", 4);                    // Again clear the screen
             write(STDOUT_FILENO, "\x1b[H", 3);
             exit(0);
+            break;
+        case CTRL_KEY('s'):
+            saveToFile();
             break;
         case PAGE_DOWN:
         case PAGE_UP:
@@ -610,7 +714,23 @@ void editorProcessKeypress()
         case ARROW_UP:
             moveCursor(char_read);
             break;
+        
+        case BACKSPACE:
+        case CTRL_KEY('h'):
+        case DEL_KEY:
+            /*TODO*/
+            break;
+        case CTRL_KEY('l'):
+        case '\x1b':        //we don't do anything when these to are pressed. For example, ctrl-l key refreshes the terminal but the terminal is automatically refreshed
+            break;
+
+        default:
+            insertChar(char_read); //in case there is no keypress mapped to something, then it will be interpreted as a simple character
+            //and it will be added.
+            break;
     }
+
+    quit_times = LEAF_QUIT_TIMES;
 }
 
 /*** init ***/
@@ -627,6 +747,7 @@ void initEditor()
     configuration.filename = NULL;
     configuration.statusmsg[0] = '\0';
     configuration.statusmsg_time = 0;
+    configuration.dirty = 0;
     if( getWindowSize(&configuration.screenrows, &configuration.screencols) == -1 )
         die("getWidnowSize");
     configuration.screenrows -=2 ; // we leave an empty line at the end for the status bar and another one for the message box
@@ -643,7 +764,7 @@ int main(int argc, char* argv[] )
         editorOpen(argv[1]);
     }
 
-    setStatusMessage("HELP: Ctrl-X = quit");
+    setStatusMessage("HELP: Ctrl-X = quit | SAVE: Ctrl-S = save");
 
     while(1)                                            //we changed such that the terminal is not waiting for some input
     {
