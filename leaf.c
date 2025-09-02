@@ -38,6 +38,12 @@ enum editorKey{
     PAGE_DOWN
 };
 
+enum editorHighlight {
+    HL_NORMAL = 0,
+    HL_NUMBER,                       // each character which is a digit should have in the highlight array the HL_NUMBER value
+    HL_MATCH
+};
+
 /*** data ***/
 
 typedef struct textRow{
@@ -45,6 +51,7 @@ typedef struct textRow{
     int rsize; // the render size used for tabs or other non printable characters
     char* chars;
     char* render;
+    unsigned char* highlight;  // each value from this array will correspond to a character in render
 }textRow;
 
 struct editorConfig{
@@ -65,6 +72,8 @@ struct editorConfig{
 /*** Prototypes ***/
 
 void setStatusMessage(const char* format, ... ); // otherwise we wouldn't be able to compile the save to file function because we used there a function before it was defined
+void refreshScreen();
+char* prompt( char* prompt, void (*callback)(char* , int) );
 
 /*** Terminal ***/
 
@@ -232,6 +241,32 @@ int getWindowSize(int* rows, int* cols)                           // This functi
     return 0;
 }
 
+/*** Syntax highlight ***/
+
+void updateSyntax(textRow* row)
+{
+    row->highlight = realloc(row->highlight, row->rsize );
+    memset(row->highlight, HL_NORMAL, row->rsize);
+
+    for( int i = 0; i < row->rsize; i ++ )
+    {
+        if( isdigit(row->render[i]) )
+        {
+            row->highlight[i] = HL_NUMBER;
+        }
+    }
+}
+
+int syntaxToColor( int hl )
+{
+    switch( hl )
+    {
+        case HL_NUMBER: return 35;   // digits -> magenta
+        case HL_MATCH: return 96;   // matched characters -> bright cyan
+        default: return 37; // anything else -> normal
+    }
+}
+
 /*** Row operations ***/
 
 int CursorXToRenderXConverter(textRow* row, int cursorX)
@@ -250,6 +285,30 @@ int CursorXToRenderXConverter(textRow* row, int cursorX)
         renderX ++;
     }
     return renderX;
+}
+
+int RederXToCursorXConverter( textRow* row, int renderX )
+{
+    /*
+    I loop through the chars string, calculating the current rx value (current_renderX) as we go. But instead of stopping when I hit a particular 
+    cursorX value and returning current_renderX, i want to stop when current_renderX hits the given renderX value and return cursorX.
+
+    The return statement at the very end is just in case the caller provided an renderX that’s out of range, which shouldn’t happen. 
+    The return statement inside the for loop should handle all renderX values that are valid indexes into render.
+    */
+    int current_renderX = 0;
+    int cursorX;
+    for( cursorX = 0; cursorX < row->size; cursorX ++ )
+    {
+        if( row->chars[cursorX] == '\t' )
+        {
+            current_renderX += ( LEAF_TAB_STOP - 1 ) - ( current_renderX % LEAF_TAB_STOP );
+        }
+        current_renderX ++;
+        
+        if( current_renderX > renderX ) return cursorX;
+    }
+    return cursorX;
 }
 
 void UpdateRow(textRow* row)
@@ -274,6 +333,7 @@ void UpdateRow(textRow* row)
         }
     row->render[idx] = '\0';
     row->rsize = idx;
+    updateSyntax(row);
 }
 
 void insertRow(int at, char* s, size_t len)             
@@ -291,6 +351,8 @@ void insertRow(int at, char* s, size_t len)
 
     configuration.row[at].rsize = 0;                                // initializing the render size and string for the new line
     configuration.row[at].render = NULL;
+
+    configuration.row[at].highlight = NULL;
 
     UpdateRow(&configuration.row[at]);
 
@@ -324,6 +386,7 @@ void freeRow(textRow* row)
 {
     free(row->chars);
     free(row->render);
+    free(row->highlight);
 }
 
 void deleteRow(int at)
@@ -463,7 +526,14 @@ void editorOpen(char* filename)
 void saveToFile()
 {
     if( configuration.filename == NULL )
-        return;
+    {
+        configuration.filename = prompt("Save as: %s (ESC to cancel)", NULL);
+        if( configuration.filename == NULL )
+        {
+            setStatusMessage("Save aborted");
+            return;
+        }
+    }
     int length;
     char* buffer = rowsToString(&length);
 
@@ -485,6 +555,87 @@ void saveToFile()
     }
     free(buffer);
     setStatusMessage("Saving failed. I/O error: %s", strerror(errno));
+}
+
+/*** find ***/
+
+void findCallback(char* query, int key )
+{
+    /*
+    In the callback, we check if the user pressed Enter or Escape, in which case they are leaving search mode so we return immediately instead of doing another search.
+    
+    The last feature i’d like to add is to allow the user to advance to the next or previous match in the file using the arrow keys. The ↑ and ← keys will go to the previous match, and the ↓ and → keys will go to the next match.
+
+    I’ll implement this feature using two static variables in our callback. last_match will contain the index of the row that the last match was on, or -1 if there was no last match. And direction will store the direction of the search: 1 for searching forward, and -1 for searching backward.
+    */
+
+    static int last_match = -1;
+    static int direction = 1;
+
+    if( key == '\r' || key == '\x1b' )
+    {
+        last_match = -1;
+        direction = 1;
+        return;
+    }
+    else if( key == ARROW_LEFT || key == ARROW_UP )
+    {
+        direction = -1;
+    }
+    else if(  key == ARROW_RIGHT || key == ARROW_DOWN )
+    {
+        direction = 1;
+    }
+    else
+    {
+        last_match = -1;
+        direction = 1;
+    }
+
+    if( last_match == -1 )
+        direction = 1;
+    int current = last_match;
+
+    for( int i = 0; i < configuration.rows_number; i ++ )
+    {
+        current += direction;
+        if( current == -1 )
+            current = configuration.rows_number - 1;
+        else if( current == configuration.rows_number )
+            current = 0;
+
+        textRow* row = &configuration.row[current];
+        char* match = strstr(row->render, query);
+        if( match )
+        {
+            last_match = current;
+            configuration.cursorY = current;
+            configuration.cursorX = CursorXToRenderXConverter(row, match - row->render);
+            configuration.row_offset = configuration.rows_number;
+
+            memset(&row->highlight[match - row->render], HL_MATCH, strlen(query));
+            break;  
+        }
+    }
+}
+
+void find()
+{
+    int saved_cursorX = configuration.cursorX;
+    int saved_cursorY = configuration.cursorY;
+    int saved_coloffset = configuration.column_offset;
+    int saved_rowoffset = configuration.row_offset;
+
+    char* query = prompt("Search: %s (ESC or Enter to cancel | Arrows to navigate)", findCallback);
+    if( query )
+        free(query);
+    else
+    {
+        configuration.cursorX = saved_cursorX;
+        configuration.cursorY = saved_cursorY;
+        configuration.row_offset = saved_rowoffset;
+        configuration.column_offset = saved_coloffset;
+    }
 }
 
 /*** dynamic string and writing buffer ***/
@@ -653,7 +804,48 @@ void editorDrawRows(struct appendBuffer* buffer)
             if( len < 0 ) len = 0;
             if( len > configuration.screencols )
                 len = configuration.screencols;
-            BufferAdder(buffer, &configuration.row[file_row].render[configuration.column_offset], len);
+            char* c = &configuration.row[file_row].render[configuration.column_offset];
+            unsigned char* hl = &configuration.row[file_row].highlight[configuration.column_offset];
+            int currentColor = -1; //is used to not have to "feed" the buffer escape sequences after each character, only when a certain color changed
+            for( int j = 0; j < len; j ++ )
+            {
+                /*
+                    I can no longer just feed the substring of render that I want to print right into BufferAdder(). I’ll have to do it 
+                    character-by-character from now on. If it is a digit character, we precede it with the <esc>[31m escape sequence and follow it by the 
+                    <esc>[39m sequence.
+
+                    I previously used the m command (Select Graphic Rendition) to draw the status bar using inverted colors. Now I am using it 
+                    to set the text color. for more color related info check: https://en.wikipedia.org/wiki/ANSI_escape_code
+
+                    The first table says that the text color can be set using codes 30 to 37, and reset it to the default color using 39. 
+                    The color table says 0 is black, 1 is red, and so on, up to 7 which is white. 
+                    I can set the text color to magenta using 35 as an argument to the m command. After printing the digit, 
+                    I use 39 as an argument to m to set the text color back to normal.
+                    */
+                if( hl[j] == HL_NORMAL )
+                {
+                    if( currentColor != -1 )
+                    {
+                        BufferAdder(buffer, "\x1b[39m", 5);
+                        currentColor = -1;
+                    }
+                    BufferAdder(buffer, &c[j], 1);
+                }
+                else
+                {
+                    int color = syntaxToColor(hl[j]);
+                    if( color != currentColor )
+                    {
+                        currentColor = color;           
+                        char buf[16];
+                        int color_len = snprintf(buf, sizeof(buf), "\x1b[%dm", color);
+                        BufferAdder(buffer, buf, color_len);
+                    }
+
+                    BufferAdder(buffer, &c[j], 1);
+                }
+            }
+            BufferAdder(buffer, "\x1b[39m", 5);
         }
         BufferAdder(buffer, "\x1b[K", 3);                         // this is used instead of the editorClearScreen function. This escape sequence clears the whole line. For more: https://vt100.net/docs/vt100-ug/chapter3.html#EL 
         BufferAdder(buffer, "\r\n", 2);
@@ -688,6 +880,59 @@ void setStatusMessage(const char* format, ... )
 }
 
 /*** input ***/
+
+char* prompt(char* prompt, void (*callback)(char*, int)) // it takes a callback function as an argument. I will call this function after each keypress, passing the current search query inputted by the user and the last key they pressed.
+{
+    size_t size = 128;
+    char* buffer = malloc(size);
+
+    size_t length = 0;
+    buffer[0] = '\0';
+
+    while(1)
+    { //this is called when we want to save a file as someting. The infinite loop wait for 
+        setStatusMessage(prompt, buffer);
+        refreshScreen();
+
+        int c = editorReadKey();
+        if( c == '\r' )
+        {
+            if( length != 0 )
+            {
+                setStatusMessage("");
+                if( callback )
+                    callback(buffer, c);
+                return buffer;
+            }
+        }
+        else if( c == DEL_KEY || c == CTRL_KEY('h') || c == BACKSPACE )
+        {
+            if( length != 0 )
+                buffer[--length] = '\0';
+        }
+        else if( c == '\x1b' )
+        {
+            setStatusMessage("");
+            if( callback )
+                callback(buffer, c);
+            free(buffer);
+            return NULL;
+        }
+        else if( !iscntrl(c) && c < 128 )
+        {
+            if( length == size - 1 )
+            {
+                size *= 2;
+                buffer = realloc(buffer, size);
+            }
+            buffer[length++] = c;
+            buffer[length] = '\0';
+        }
+
+        if( callback )
+            callback(buffer, c);
+    }
+}
 
 void moveCursor(int key)
 {
@@ -793,6 +1038,10 @@ void editorProcessKeypress()
             moveCursor(char_read);
             break;
         
+        case CTRL_KEY('f'):
+            find();
+            break;
+
         case BACKSPACE:
         case CTRL_KEY('h'):
         case DEL_KEY:
@@ -843,7 +1092,7 @@ int main(int argc, char* argv[] )
         editorOpen(argv[1]);
     }
 
-    setStatusMessage("HELP: Ctrl-X = quit | SAVE: Ctrl-S = save");
+    setStatusMessage("HELP: Ctrl-X = quit | SAVE: Ctrl-S = save | FIND: Ctrl-F = find   ");
 
     while(1)                                            //we changed such that the terminal is not waiting for some input
     {
