@@ -24,6 +24,8 @@
 #define LEAF_VERSION "0.0.4"
 #define LEAF_TAB_STOP 8
 #define LEAF_QUIT_TIMES 2
+#define HL_HIGHLIGHT_NUMBERS (1<<0)
+#define HL_HIGHLIGHT_STRINGS (1<<1)
 
 enum editorKey{
     BACKSPACE = 127,    
@@ -40,14 +42,30 @@ enum editorKey{
 
 enum editorHighlight {
     HL_NORMAL = 0,
+    HL_COMMENT,
+    HL_MLCOMMENT,
+    HL_KEYWORD1,
+    HL_KEYWORD2,
+    HL_STRING,
     HL_NUMBER,                       // each character which is a digit should have in the highlight array the HL_NUMBER value
     HL_MATCH
 };
 
 /*** data ***/
 
+struct syntax{
+    char* filetype; // name of the file type which will be desplayed
+    char** filematch; // array of strings where each string contains a pattern to match a filename again. 
+    char** keywords; // an array of keywords, being NULL terminated
+    char*  singleline_comment_start; // where does an online comment starts
+    char* multiline_comment_start; // where does a multiline comment start ( in c is /*)
+    char* multiline_comment_end; // in c is */
+    int flags; // flags is a bit field that will contain flags for whether to highlight numbers and whether to highlight strings for that filetype
+};
 typedef struct textRow{
     int size;
+    int idx; // each row knows its index in the whole file
+    int in_multiline_open_comment; // boolean flag
     int rsize; // the render size used for tabs or other non printable characters
     char* chars;
     char* render;
@@ -67,7 +85,34 @@ struct editorConfig{
     char statusmsg[80]; // these two are for the status message 
     time_t statusmsg_time;
     struct termios original_termios;                            // Original terminal state
+    struct syntax* syntax;
 }configuration;
+
+/*** Filetypes ***/
+
+char* C_HL_extensions[] = {".c", ".h", ".cpp", NULL};
+char* C_HL_keywords[] = {
+  "switch", "if", "while", "for", "break", "continue", "return", "else",
+  "struct", "union", "typedef", "static", "enum", "class", "case",
+
+  "int|", "long|", "double|", "float|", "char|", "unsigned|", "signed|",
+  "void|", NULL // the second type of keyword is differentaite using the | character
+};
+
+struct syntax HLDB[] = {    // HLDB = highlight database 
+    {/*
+        The syntax struct for the C language contains the string "c" for the filetype field, 
+        the extensions ".c", ".h", and ".cpp" for the filematch field (the array must be terminated with NULL), 
+        and the HL_HIGHLIGHT_NUMBERS flag turned on in the flags field.*/
+        "c",
+        C_HL_extensions,
+        C_HL_keywords,
+        "//", "/*", "*/",
+        HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
+    },
+};
+
+#define HDLB_ENTRIES (sizeof(HLDB) / sizeof(HLDB[0]))
 
 /*** Prototypes ***/
 
@@ -243,17 +288,169 @@ int getWindowSize(int* rows, int* cols)                           // This functi
 
 /*** Syntax highlight ***/
 
+int is_separator(int c)
+{
+    return isspace(c) || c == '\0' || strchr(",._(){}[]/+-=;*<>%", c) != NULL; // we use this function to properly delimit a number from a name which contains digits
+}
+
 void updateSyntax(textRow* row)
 {
     row->highlight = realloc(row->highlight, row->rsize );
     memset(row->highlight, HL_NORMAL, row->rsize);
 
-    for( int i = 0; i < row->rsize; i ++ )
+    if( configuration.syntax == NULL )
+        return;
+
+    int prev_sep = 1;
+    int in_string = 0;
+    int in_comment = ( row->idx > 0 && configuration.row[row->idx - 1].in_multiline_open_comment); // used only for multi line comments
+
+    char* comment_start = configuration.syntax->singleline_comment_start; // alias
+    char* mcs = configuration.syntax->multiline_comment_start; // alias
+    char* mce = configuration.syntax->multiline_comment_end; // alias
+
+    int comment_start_len = comment_start ? strlen(comment_start) : 0;
+    int mcs_len = mcs ? strlen(mcs) : 0;
+    int mce_len = mce ? strlen(mce) : 0;
+
+    char** keywords = configuration.syntax->keywords;   // just an alias
+
+    int i = 0;
+    while( i < row->rsize )
     {
-        if( isdigit(row->render[i]) )
+        char c = row->render[i];
+        unsigned char prev_hl = ( i > 0 ) ? row->highlight[i-1] : HL_NORMAL;
+
+        if( comment_start_len && !in_string && !in_comment ) // single line comments should not be recognisd inside multi line comments
         {
-            row->highlight[i] = HL_NUMBER;
+            if( !strncmp(&row->render[i], comment_start, comment_start_len) )
+            {
+                memset(&row->highlight[i], HL_COMMENT, row->rsize - i);
+                break;
+            }
         }
+
+        if( mcs_len && mce_len && !in_string ) // we need to have both mcs and mce different fro NULL to be in a multi line comment and also not to be in a string
+        {
+            if( in_comment )
+            {
+                row->highlight[i] = HL_MLCOMMENT;
+                if( !strncmp( &row->render[i], mce, mce_len ) ) // we check if we are at the end of the multiline comment
+                {
+                    memset(&row->highlight[i], HL_MLCOMMENT, mce_len); // we set the whole comment terminator to the color 
+                    i += mce_len; // and i consume it
+                    in_comment = 0;
+                    prev_sep = 1;
+                    continue;
+                }
+                else
+                {
+                    i++;
+                    continue;
+                }
+            }
+            else if( !strncmp( &row->render[i], mcs, mcs_len ) ) // we check if we are at the beginning of the multi line comment
+            {
+                memset(&row->highlight[i], HL_MLCOMMENT, mcs_len);
+                i += mcs_len;
+                in_comment = 1;
+                continue;
+            }
+        }
+
+        if( configuration.syntax->flags & HL_HIGHLIGHT_STRINGS )
+        {
+            /*
+             If in_string is set, then i know the current character can be highlighted with HL_STRING. 
+             Then i check if the current character is the closing quote (c == in_string), and if so, we reset in_string to 0. 
+             Then, since i highlighted the current character, i have to consume it by incrementing i and continueing out of the 
+             current loop iteration. We also set prev_sep to 1 so that if i'm done highlighting the string, the closing quote 
+             is considered a separator.
+
+            If i'm not currently in a string, then i have to check if i'm at the beginning of one by checking 
+            for a double- or single-quote. If i am, i store the quote in in_string, highlight it with HL_STRING, 
+            and consume it.
+            */
+            if( in_string )
+            {
+                row->highlight[i] = HL_STRING;
+                if( c == '\\' && i + 1 < row->size )
+                {
+                    row->highlight[i+1] = HL_STRING;
+                    i += 2;
+                    continue;
+                }
+                if( c == in_string )
+                    in_string = 0;
+                i++;
+                prev_sep = 1;
+                continue;
+            }
+            else
+            {
+                if( c == '"' || c == '\'' )
+                {
+                    in_string = c;
+                    row->highlight[i] = HL_STRING;
+                    i++;
+                    continue;
+                }
+            }
+        }
+
+        if( configuration.syntax->flags & HL_HIGHLIGHT_NUMBERS )
+        {
+            if(( isdigit(c) && ( prev_sep || prev_hl == HL_NUMBER )) ||
+            (c == '.' && prev_hl == HL_NUMBER)) // supports numbers with decimal point
+            {
+                row->highlight[i] = HL_NUMBER;
+                i++;
+                prev_sep = 0;
+                continue;
+            }
+        }
+
+        if( prev_sep )
+        {
+            int j;
+            for( j = 0; keywords[j]; j ++ )
+            {
+                int key_len = strlen(keywords[j]);
+                int key2 = keywords[j][key_len - 1] == '|';
+                if( key2 )  // checking the type of keyword
+                    key_len --;
+                if( !strncmp(&row->render[i], keywords[j], key_len) && 
+                is_separator(row->render[i + key_len])) // a keyword needs a separator both before and after ( to eliminate this case: void, avoid)
+                {
+                    memset(&row->highlight[i], key2 ? HL_KEYWORD1 : HL_KEYWORD2, key_len);
+                    i += key_len;
+                    break;
+                }
+            }
+            if( keywords[j] != NULL )
+            {
+                prev_sep = 0;
+                continue;
+            }
+        }
+        prev_sep = is_separator(c);
+        i++;
+    }
+    int changed = (row->in_multiline_open_comment != in_comment );
+    row->in_multiline_open_comment = in_comment; // tells me whether the ended as an unclosed multi-line comment or not. 
+    if( changed && row->idx + 1 < configuration.rows_number )
+    {
+        /*
+        Then i have to consider updating the syntax of the next lines in the file. So far, i have only been updating the 
+        syntax of a line when the user changes that specific line. But with multi-line comments, a user could comment out an
+        entire file just by changing one line. So it seems like i need to update the syntax of all the lines following the 
+        current line. However, i know the highlighting of the next line will not change if the value of this line’s 
+        in_multiline_open_comment did not change. So i check if it changed, and only call updateSyntax() on the next line 
+        if in_multiline_open_comment changed (and if there is a next line in the file). Because updateSyntax() keeps calling 
+        itself with the next line, the change will continue to propagate to more and more lines until one of them is unchanged,
+        at which point i know that all the lines after that one must be unchanged as well.
+        */
+        updateSyntax(&configuration.row[row->idx + 1]);
     }
 }
 
@@ -261,9 +458,51 @@ int syntaxToColor( int hl )
 {
     switch( hl )
     {
+        case HL_STRING: return 33; // strings -> yellow
+        case HL_KEYWORD1: return 32; // one type of keyword will be green
+        case HL_KEYWORD2: return 31; // the other type will be red
         case HL_NUMBER: return 35;   // digits -> magenta
         case HL_MATCH: return 96;   // matched characters -> bright cyan
+        case HL_MLCOMMENT:  // we have the multi line comment the same color as the one liners
+        case HL_COMMENT: return 90; // comments -> bright black
         default: return 37; // anything else -> normal
+    }
+}
+
+void selectSyntaxHighlight()
+{
+    configuration.syntax = NULL;
+    if( configuration.filename == NULL )
+        return;
+    char* extension = strrchr(configuration.filename, '.');
+
+    for( unsigned int i = 0; i < HDLB_ENTRIES; i ++ )
+    {
+        struct syntax* syntax = &HLDB[i];
+        int j = 0;
+        while( syntax->filematch[j] )
+        {
+            /*
+            I loop through each syntax struct in the HLDB array, and for each one of those, i loop through each pattern 
+            in its filematch array. If the pattern starts with a ., then it’s a file extension pattern, and we use strcmp() 
+            to see if the filename ends with that extension. If it’s not a file extension pattern, then i just check to 
+            see if the pattern exists anywhere in the filename, using strstr(). If the filename matched according to those 
+            rules, then i set configuration.syntax to the current syntax struct, and return.
+            */
+            int is_extension = ( syntax->filematch[j][0] == '.' );
+            if(( is_extension && extension && !strcmp(extension, syntax->filematch[j] ))
+            || (!is_extension && strcmp(configuration.filename, syntax->filematch[j])))
+            {
+                configuration.syntax = syntax;
+                int filerow;
+                for( filerow = 0; filerow < configuration.rows_number; filerow ++ )
+                {
+                    updateSyntax(&configuration.row[filerow]);  // to highlight when saving a new file with a specific extension
+                }
+                return;
+            }
+            j ++;
+        }
     }
 }
 
@@ -343,7 +582,12 @@ void insertRow(int at, char* s, size_t len)
         return;
     configuration.row = realloc(configuration.row, sizeof(textRow) * ( configuration.rows_number + 1 ) );
     memmove(&configuration.row[at + 1], &configuration.row[at], sizeof(textRow) * (configuration.rows_number - at));
+    for( int i = at + 1; i <= configuration.rows_number; i ++ )
+    {
+        configuration.row[i].idx ++;
+    }
 
+    configuration.row[at].idx = at;
     configuration.row[at].size = len;
     configuration.row[at].chars = malloc(len + 1);
     memcpy(configuration.row[at].chars, s, len);
@@ -353,7 +597,7 @@ void insertRow(int at, char* s, size_t len)
     configuration.row[at].render = NULL;
 
     configuration.row[at].highlight = NULL;
-
+    configuration.row[at].in_multiline_open_comment = 0;
     UpdateRow(&configuration.row[at]);
 
     configuration.rows_number ++;
@@ -395,6 +639,10 @@ void deleteRow(int at)
         return;
     freeRow(&configuration.row[at]);    //free memory owned by the deleted row
     memmove(&configuration.row[at], &configuration.row[at + 1], sizeof(textRow) * (configuration.rows_number - at - 1)); 
+    for( int i = at; i < configuration.rows_number - 1; i ++ )
+    {
+        configuration.row[i].idx --;
+    }
     configuration.rows_number --;//memmove() to overwrite the deleted row struct with the rest of the rows that come after it, and decrement the number of rows. 
     configuration.dirty ++;
 }
@@ -494,6 +742,9 @@ void editorOpen(char* filename)
 {
     free(configuration.filename);
     configuration.filename = strdup(filename); //It makes a copy of the given string, allocating the required memory and assuming you will free() that memory.
+    
+    selectSyntaxHighlight();
+
     FILE* fp = fopen(filename, "r");
     if(!fp) die("fopen");
 
@@ -533,6 +784,7 @@ void saveToFile()
             setStatusMessage("Save aborted");
             return;
         }
+        selectSyntaxHighlight();
     }
     int length;
     char* buffer = rowsToString(&length);
@@ -571,6 +823,16 @@ void findCallback(char* query, int key )
 
     static int last_match = -1;
     static int direction = 1;
+
+    static int saved_hl_line; //saves the line of the last find
+    static int* saved_hl = NULL; // dynamically allocated array which contains the highlight structre of the previously changed line
+
+    if( saved_hl )
+    {//if there is something to restore, we do it (we change back the color of the previously found sequence from blue to white)
+        memcpy(configuration.row[saved_hl_line].highlight, saved_hl, configuration.row[saved_hl_line].rsize);
+        free(saved_hl);
+        saved_hl = NULL;
+    }
 
     if( key == '\r' || key == '\x1b' )
     {
@@ -613,6 +875,9 @@ void findCallback(char* query, int key )
             configuration.cursorX = CursorXToRenderXConverter(row, match - row->render);
             configuration.row_offset = configuration.rows_number;
 
+            saved_hl_line = current;
+            saved_hl = malloc(row->rsize);//we load the things we will have to change
+            memcpy(saved_hl, row->highlight, row->rsize);
             memset(&row->highlight[match - row->render], HL_MATCH, strlen(query));
             break;  
         }
@@ -681,8 +946,10 @@ void drawStatusBar(struct appendBuffer* buffer)
     int len = snprintf(status, sizeof(status), "%.20s - %d lines %s", 
         configuration.filename ? configuration.filename : "[NO NAME]", configuration.rows_number,
     configuration.dirty ? "(modified)" : ""); //"prints" in the status char max 20 characters from the file name and the number of lines in the file
-    int len_line_number = snprintf(lineNumber, sizeof(lineNumber), "%d/%d", 
+    int len_line_number = snprintf(lineNumber, sizeof(lineNumber), "%s | %d/%d", 
+        configuration.syntax ? configuration.syntax->filetype : "no type", // say what filetype i have
         configuration.cursorY + 1, configuration.rows_number); // we use cursorY + 1 because it is 0 indexed
+    
     if( len > configuration.screencols )
         len = configuration.screencols; //we make sure the status bar is only one line long
     BufferAdder(buffer, status, len);
@@ -822,7 +1089,27 @@ void editorDrawRows(struct appendBuffer* buffer)
                     I can set the text color to magenta using 35 as an argument to the m command. After printing the digit, 
                     I use 39 as an argument to m to set the text color back to normal.
                     */
-                if( hl[j] == HL_NORMAL )
+                if( iscntrl( c[j] ) )
+                {
+                    /*
+                    I'm going to translate nonprintable characters into printable ones. I’ll render the alphabetic control 
+                    characters (Ctrl-A = 1, Ctrl-B = 2, …, Ctrl-Z = 26) as the capital letters A through Z. I’ll also render 
+                    the 0 byte like a control character. Ctrl-@ = 0, so i’ll render it as an @ sign. Finally, any other 
+                    nonprintable characters i’ll render as a question mark (?). And to differentiate these characters from
+                     their printable counterparts, i’ll render them using inverted colors (black on white).
+                    */
+                    char sym = (c[j] <= 26 ) ? '@' + c[j] : '?';
+                    BufferAdder(buffer, "\x1b[7m", 4);
+                    BufferAdder(buffer, &sym, 4);
+                    BufferAdder(buffer, "\x1b[m", 3);
+                    if( currentColor != -1 )
+                    {
+                        char buf[16]; //inverted colors
+                        int char_len = snprintf(buf, sizeof(buf), "\x1b[%dm", currentColor);
+                        BufferAdder(buffer, buf, char_len);
+                    }
+                }
+                else if( hl[j] == HL_NORMAL )
                 {
                     if( currentColor != -1 )
                     {
@@ -1076,6 +1363,7 @@ void initEditor()
     configuration.statusmsg[0] = '\0';
     configuration.statusmsg_time = 0;
     configuration.dirty = 0;
+    configuration.syntax = NULL;    // no filetype for the current file
     if( getWindowSize(&configuration.screenrows, &configuration.screencols) == -1 )
         die("getWidnowSize");
     configuration.screenrows -=2 ; // we leave an empty line at the end for the status bar and another one for the message box
