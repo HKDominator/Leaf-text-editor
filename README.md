@@ -80,7 +80,7 @@ You can replace the placeholder `hello.c` with any file.
 - Configurable keybindings and settings file
 - Better cross-platform support (Windows adapter)
 - Mouse support and selection
-- Multiple files manipulation
+- Multiple file manipulation
 
 ---
 
