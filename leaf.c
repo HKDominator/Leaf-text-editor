@@ -943,9 +943,22 @@ void drawStatusBar(struct appendBuffer* buffer)
     char status[80], lineNumber[80];
     BufferAdder(buffer, "\x1b[7m", 4);
 
+    const char* dirty_msg = "";
+    if( configuration.dirty > 0 )
+    {
+        if( configuration.dirty < 25 )
+            dirty_msg = "(modified)";
+        else if( configuration.dirty < 50 )
+            dirty_msg = "(modified + )";
+        else if( configuration.dirty < 250 )
+            dirty_msg = "(heavily modified)";
+        else if( configuration.dirty < 500 )
+            dirty_msg = "(very dirty!)";
+        else
+            dirty_msg = "(EXTREMLY DIRTY!!!)";
+    }
     int len = snprintf(status, sizeof(status), "%.20s - %d lines %s", 
-        configuration.filename ? configuration.filename : "[NO NAME]", configuration.rows_number,
-    configuration.dirty ? "(modified)" : ""); //"prints" in the status char max 20 characters from the file name and the number of lines in the file
+        configuration.filename ? configuration.filename : "[NO NAME]", configuration.rows_number, dirty_msg );//"prints" in the status char max 20 characters from the file name and the number of lines in the file
     int len_line_number = snprintf(lineNumber, sizeof(lineNumber), "%s | %d/%d", 
         configuration.syntax ? configuration.syntax->filetype : "no type", // say what filetype i have
         configuration.cursorY + 1, configuration.rows_number); // we use cursorY + 1 because it is 0 indexed
@@ -1067,13 +1080,21 @@ void editorDrawRows(struct appendBuffer* buffer)
         }
         else
         {
+            // char lineNumber[80];
+            // int numberLength = snprintf(lineNumber, sizeof(numberLength), "%d ", configuration.row[file_row].idx - 1); // adds for each row at the beginning the row number
+            // BufferAdder(buffer, lineNumber, numberLength);
+            
+
             int len = configuration.row[file_row].rsize - configuration.column_offset;
-            if( len < 0 ) len = 0;
+            if( len < 0 ) 
+                len = 0;
             if( len > configuration.screencols )
                 len = configuration.screencols;
+
             char* c = &configuration.row[file_row].render[configuration.column_offset];
             unsigned char* hl = &configuration.row[file_row].highlight[configuration.column_offset];
             int currentColor = -1; //is used to not have to "feed" the buffer escape sequences after each character, only when a certain color changed
+            
             for( int j = 0; j < len; j ++ )
             {
                 /*
@@ -1228,7 +1249,7 @@ void moveCursor(int key)
     switch(key)
     {
         case ARROW_LEFT:
-            if( configuration.cursorX != 0 )
+            if( configuration.cursorX != 0 ) /// was 0 
                 configuration.cursorX --;
             else if(configuration.cursorY > 0)
             {
@@ -1244,7 +1265,7 @@ void moveCursor(int key)
             else if( row && configuration.cursorX == row->size )
             {
                 configuration.cursorY ++;
-                configuration.cursorX = 0;
+                configuration.cursorX = 0; // 0
             }
             break;
         case ARROW_UP:
